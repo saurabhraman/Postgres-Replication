@@ -1,0 +1,113 @@
+# docker-compose.yml
+
+services:
+  # ---------------------------------------------------------------------------
+  # Primary Database
+  # ---------------------------------------------------------------------------
+  db-primary:
+    build: .
+    container_name: mfi-postgres-primary
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      POSTGRES_DB: mfi_banking
+    volumes:
+      - pgdata-primary:/var/lib/postgresql/data
+      - pg-archive:/var/lib/postgresql/archive
+      - ./config/postgresql.conf:/etc/postgresql/postgresql.conf
+      - ./config/pg_hba.conf:/etc/postgresql/pg_hba.conf
+    ports:
+      - "0.0.0.0:8008:5432"
+    networks:
+      mfi-network:
+        ipv4_address: 172.16.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mfi_banking"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: >
+      postgres
+      -c config_file=/etc/postgresql/postgresql.conf
+      -c hba_file=/etc/postgresql/pg_hba.conf
+
+  # ---------------------------------------------------------------------------
+  # Replica Database (Read-Only Streaming Replica)
+  # ---------------------------------------------------------------------------
+  db-replica:
+    build:
+      context: .
+      dockerfile: Dockerfile.replica
+    container_name: mfi-postgres-replica
+    environment:
+      PGPASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+    volumes:
+      - pgdata-replica:/var/lib/postgresql/data
+      - ./config/postgresql.conf:/etc/postgresql/postgresql.conf
+      - ./config/pg_hba.conf:/etc/postgresql/pg_hba.conf
+    ports:
+      - "0.0.0.0:8009:5432"
+    networks:
+      mfi-network:
+        ipv4_address: 172.16.0.11
+    depends_on:
+      db-primary:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Backup Service (Runs Nightly at 2 AM)
+  # ---------------------------------------------------------------------------
+  db-backup:
+    image: postgres:17
+    container_name: mfi-postgres-backup
+    environment:
+      PGPASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      DB_HOST: db-primary
+      DB_USER: postgres
+      DB_NAME: mfi_banking
+      BACKUP_RETAIN_DAYS: 7
+    volumes:
+      - ./backups:/backups
+      - ./scripts/backup.sh:/backup.sh
+    networks:
+      - mfi-network
+    depends_on:
+      db-primary:
+        condition: service_healthy
+    # Use a sleep loop instead of cron (cron is not installed in postgres:17)
+    # Runs backup at startup, then every 24 hours (aligned to 2 AM)
+    command: >
+      bash -c "
+        chmod +x /backup.sh &&
+        echo 'Backup container started. Running initial backup...' &&
+        /backup.sh &&
+        echo 'Scheduling nightly backups at 2:00 AM...' &&
+        while true; do
+          CURRENT_HOUR=$$(date +%H) &&
+          CURRENT_MIN=$$(date +%M) &&
+          TARGET_HOUR=2 &&
+          TARGET_MIN=0 &&
+          CURRENT_SECS=$$(( CURRENT_HOUR * 3600 + CURRENT_MIN * 60 )) &&
+          TARGET_SECS=$$(( TARGET_HOUR * 3600 + TARGET_MIN * 60 )) &&
+          if [ $$TARGET_SECS -le $$CURRENT_SECS ]; then
+            SLEEP_SECS=$$(( 86400 - CURRENT_SECS + TARGET_SECS ));
+          else
+            SLEEP_SECS=$$(( TARGET_SECS - CURRENT_SECS ));
+          fi &&
+          echo \"Next backup in $$SLEEP_SECS seconds (at 2:00 AM)\" &&
+          sleep $$SLEEP_SECS &&
+          /backup.sh;
+        done
+      "
+
+volumes:
+  pgdata-primary:
+  pgdata-replica:
+  pg-archive:
+
+networks:
+  mfi-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.16.0.0/24

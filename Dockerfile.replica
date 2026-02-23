@@ -1,0 +1,14 @@
+# Dockerfile.replica
+FROM postgres:17
+
+# Copy configuration files
+COPY config/postgresql.conf /etc/postgresql/postgresql.conf
+COPY config/pg_hba.conf /etc/postgresql/pg_hba.conf
+
+# Copy replica entrypoint
+COPY scripts/replica-entrypoint.sh /replica-entrypoint.sh
+RUN chmod +x /replica-entrypoint.sh
+
+EXPOSE 5432
+
+ENTRYPOINT ["/replica-entrypoint.sh"]

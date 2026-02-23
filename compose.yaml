@@ -1,0 +1,109 @@
+# compose.yaml — Pulls pre-built images from GitLab Container Registry
+#
+# Required environment variables (set as GitLab CI/CD variables, NOT in .env):
+#   REGISTRY_URL  - GitLab registry path, e.g. registry.gitlab.com/<group>/<project>
+#   DB_PASSWORD   - PostgreSQL password
+
+services:
+  # ---------------------------------------------------------------------------
+  # Primary Database
+  # ---------------------------------------------------------------------------
+  db-primary:
+    image: ${REGISTRY_URL}/primary:latest
+    container_name: mfi-postgres-primary
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD as CI/CD variable}
+      POSTGRES_DB: mfi_banking
+    volumes:
+      - pgdata-primary:/var/lib/postgresql/data
+      - pg-archive:/var/lib/postgresql/archive
+    ports:
+      - "0.0.0.0:8008:5432"
+    networks:
+      mfi-network:
+        ipv4_address: 172.16.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mfi_banking"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: >
+      postgres
+      -c config_file=/etc/postgresql/postgresql.conf
+      -c hba_file=/etc/postgresql/pg_hba.conf
+
+  # ---------------------------------------------------------------------------
+  # Replica Database (Read-Only Streaming Replica)
+  # ---------------------------------------------------------------------------
+  db-replica:
+    image: ${REGISTRY_URL}/replica:latest
+    container_name: mfi-postgres-replica
+    environment:
+      PGPASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD as CI/CD variable}
+    volumes:
+      - pgdata-replica:/var/lib/postgresql/data
+    ports:
+      - "0.0.0.0:8009:5432"
+    networks:
+      mfi-network:
+        ipv4_address: 172.16.0.11
+    depends_on:
+      db-primary:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Backup Service (Runs Nightly at 2 AM)
+  # ---------------------------------------------------------------------------
+  db-backup:
+    image: ${REGISTRY_URL}/backup:latest
+    container_name: mfi-postgres-backup
+    environment:
+      PGPASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD as CI/CD variable}
+      DB_HOST: db-primary
+      DB_USER: postgres
+      DB_NAME: mfi_banking
+      BACKUP_RETAIN_DAYS: 7
+    volumes:
+      - ./backups:/backups
+      - ./scripts/backup.sh:/backup.sh
+    networks:
+      - mfi-network
+    depends_on:
+      db-primary:
+        condition: service_healthy
+    command: >
+      bash -c "
+        chmod +x /backup.sh &&
+        echo 'Backup container started. Running initial backup...' &&
+        /backup.sh &&
+        echo 'Scheduling nightly backups at 2:00 AM...' &&
+        while true; do
+          CURRENT_HOUR=$$(date +%H) &&
+          CURRENT_MIN=$$(date +%M) &&
+          TARGET_HOUR=2 &&
+          TARGET_MIN=0 &&
+          CURRENT_SECS=$$(( CURRENT_HOUR * 3600 + CURRENT_MIN * 60 )) &&
+          TARGET_SECS=$$(( TARGET_HOUR * 3600 + TARGET_MIN * 60 )) &&
+          if [ $$TARGET_SECS -le $$CURRENT_SECS ]; then
+            SLEEP_SECS=$$(( 86400 - CURRENT_SECS + TARGET_SECS ));
+          else
+            SLEEP_SECS=$$(( TARGET_SECS - CURRENT_SECS ));
+          fi &&
+          echo \"Next backup in $$SLEEP_SECS seconds (at 2:00 AM)\" &&
+          sleep $$SLEEP_SECS &&
+          /backup.sh;
+        done
+      "
+
+volumes:
+  pgdata-primary:
+  pgdata-replica:
+  pg-archive:
+
+networks:
+  mfi-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.16.0.0/24

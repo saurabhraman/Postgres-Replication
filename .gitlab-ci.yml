@@ -1,0 +1,85 @@
+stages:
+  - build
+  - deploy
+
+variables:
+  # Use Docker-in-Docker
+  DOCKER_TLS_CERTDIR: "/certs"
+  # Image names in GitLab Container Registry
+  PRIMARY_IMAGE: $CI_REGISTRY_IMAGE/primary
+  REPLICA_IMAGE: $CI_REGISTRY_IMAGE/replica
+  BACKUP_IMAGE: $CI_REGISTRY_IMAGE/backup
+
+# ---------------------------------------------------------------------------
+# Build & Push Primary Database Image
+# ---------------------------------------------------------------------------
+build-primary:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $PRIMARY_IMAGE:$CI_COMMIT_SHORT_SHA -t $PRIMARY_IMAGE:latest .
+    - docker push $PRIMARY_IMAGE:$CI_COMMIT_SHORT_SHA
+    - docker push $PRIMARY_IMAGE:latest
+  only:
+    - main
+
+# ---------------------------------------------------------------------------
+# Build & Push Replica Database Image
+# ---------------------------------------------------------------------------
+build-replica:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -f Dockerfile.replica -t $REPLICA_IMAGE:$CI_COMMIT_SHORT_SHA -t $REPLICA_IMAGE:latest .
+    - docker push $REPLICA_IMAGE:$CI_COMMIT_SHORT_SHA
+    - docker push $REPLICA_IMAGE:latest
+  only:
+    - main
+
+# ---------------------------------------------------------------------------
+# Build & Push Backup Image (postgres:17 re-tagged to GitLab Registry)
+# ---------------------------------------------------------------------------
+build-backup:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker pull postgres:17
+    - docker tag postgres:17 $BACKUP_IMAGE:$CI_COMMIT_SHORT_SHA
+    - docker tag postgres:17 $BACKUP_IMAGE:latest
+    - docker push $BACKUP_IMAGE:$CI_COMMIT_SHORT_SHA
+    - docker push $BACKUP_IMAGE:latest
+  only:
+    - main
+
+# ---------------------------------------------------------------------------
+# Deploy to Server
+# ---------------------------------------------------------------------------
+deploy:
+  stage: deploy
+  tags:
+    - ec2-dev-deploy
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - mkdir -p /opt/mfi-hub/scripts /opt/mfi-hub/backups
+    - cp compose.yaml /opt/mfi-hub/compose.yaml
+    - cp scripts/backup.sh /opt/mfi-hub/scripts/backup.sh
+    - cd /opt/mfi-hub
+    - export REGISTRY_URL=$CI_REGISTRY_IMAGE
+    - export DB_PASSWORD=$DB_PASSWORD
+    - docker compose pull
+    - docker compose up -d
+  only:
+    - main
