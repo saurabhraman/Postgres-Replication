@@ -1,4 +1,4 @@
-# MFI Banking System - Database
+# Postgres Database Replication (Hot/Hot)
 
 PostgreSQL 17 database with streaming replication and automated nightly backups.
 
